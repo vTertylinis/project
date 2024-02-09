@@ -1,0 +1,1431 @@
+"use strict";
+const AWS = require("aws-sdk");
+AWS.config.update({
+  region: "eu-west-1"
+});
+const _ = require("lodash");
+const client = new AWS.DynamoDB.DocumentClient();
+const { Client, LatLng } = require("@googlemaps/google-maps-services-js");
+const Promise = require("bluebird");
+const keys = require("./google-directions-keys.json");
+
+exports.handler = async (event) => {
+  class CustomError extends Error {
+    constructor(...args) {
+      super(...args);
+      Error.captureStackTrace(this, CustomError);
+      this.name = "CustomError";
+    }
+  }
+
+  try {
+    console.log("event", event);
+    const random_item_key = _.first(_.shuffle(keys.google_cloud_keys));
+    const apikey = random_item_key.key;
+    const googleMapsClient = new Client({});
+    const maxDinst = 1000;
+
+    const { device_id, group } = event.requestContext.authorizer;
+
+    if (!group || !device_id) {
+      throw new CustomError("unauthorized");
+    }
+    const zonesParams = {
+      TableName: "storeAccounts",
+      KeyConditionExpression: "#group = :group",
+      ExpressionAttributeNames: {
+        "#group": "group"
+      },
+      ExpressionAttributeValues: {
+        ":group": group
+      }
+    };
+    const parseBoundaries = (boundariesString) => {
+      const boundaryCoordinates = boundariesString.split(",").map(parseFloat);
+      const boundaries = [];
+
+      for (let i = 0; i < boundaryCoordinates.length; i += 2) {
+        boundaries.push({
+          latitude: boundaryCoordinates[i],
+          longitude: boundaryCoordinates[i + 1]
+        });
+      }
+
+      return boundaries;
+    };
+
+    function getRandomPointNearby(point, distanceInMeters) {
+      console.log("point", point);
+      // Radius of the Earth in meters
+      const earthRadius = 6371000; // approximately 6,371 kilometers
+
+      // Convert latitude and longitude from degrees to radians
+      const lat1 = (Math.PI / 180) * point.latitude;
+      const lng1 = (Math.PI / 180) * point.longitude;
+
+      // Calculate a random angle in radians
+      const randomAngle = Math.random() * 2 * Math.PI;
+
+      // Calculate the new latitude and longitude
+      const lat2 =
+        lat1 + (distanceInMeters / earthRadius) * Math.cos(randomAngle);
+      const lng2 =
+        lng1 + (distanceInMeters / earthRadius) * Math.sin(randomAngle);
+
+      // Convert latitude and longitude back to degrees
+      const newLat = (180 / Math.PI) * lat2;
+      const newLng = (180 / Math.PI) * lng2;
+
+      // Create a new point object with the random coordinates
+      const randomPoint = { latitude: newLat, longitude: newLng };
+
+      return randomPoint;
+    }
+
+    function getRandomPointInArea(polygonCoordinates) {
+      // Assuming polygonCoordinates is an array of { latitude, longitude } objects
+
+      // Find the bounding box of the polygon
+      let minX = Number.MAX_VALUE;
+      let minY = Number.MAX_VALUE;
+      let maxX = Number.MIN_VALUE;
+      let maxY = Number.MIN_VALUE;
+
+      for (const coord of polygonCoordinates) {
+        minX = Math.min(minX, coord.longitude);
+        minY = Math.min(minY, coord.latitude);
+        maxX = Math.max(maxX, coord.longitude);
+        maxY = Math.max(maxY, coord.latitude);
+      }
+
+      // Generate random coordinates within the bounding box
+      const randomLongitude = Math.random() * (maxX - minX) + minX;
+      const randomLatitude = Math.random() * (maxY - minY) + minY;
+
+      // Check if the random point is inside the polygon
+      let isInside = false;
+      for (
+        let i = 0, j = polygonCoordinates.length - 1;
+        i < polygonCoordinates.length;
+        j = i++
+      ) {
+        if (
+          polygonCoordinates[i].latitude > randomLatitude !==
+            polygonCoordinates[j].latitude > randomLatitude &&
+          randomLongitude <
+            ((polygonCoordinates[j].longitude -
+              polygonCoordinates[i].longitude) *
+              (randomLatitude - polygonCoordinates[i].latitude)) /
+              (polygonCoordinates[j].latitude -
+                polygonCoordinates[i].latitude) +
+              polygonCoordinates[i].longitude
+        ) {
+          isInside = !isInside;
+        }
+      }
+
+      if (isInside) {
+        return { latitude: randomLatitude, longitude: randomLongitude };
+      } else {
+        // If the random point is outside the polygon, recursively try again
+        return getRandomPointInArea(polygonCoordinates);
+      }
+    }
+    async function updateGoogleTable() {
+      const formattedDate = new Date().toLocaleDateString("el-GR");
+      const params = {
+        TableName: "google-api-counter",
+        Key: {
+          "apikey-date": `${apikey}-${formattedDate}`
+        },
+        UpdateExpression:
+          "SET #counter = if_not_exists(#counter, :zero) + :incr,#walking = if_not_exists(#walking, :zero) + :incr, #apikey = :apikeyValue",
+        ExpressionAttributeNames: {
+          "#counter": "counter",
+          "#walking": "walking",
+          "#apikey": "apikey"
+        },
+        ExpressionAttributeValues: {
+          ":zero": 0,
+          ":incr": 1,
+          ":apikeyValue": apikey
+        },
+        ReturnValues: "UPDATED_NEW"
+      };
+
+      try {
+        await client.update(params).promise();
+        console.log("Item updated successfully");
+      } catch (error) {
+        console.error("Error updating item:", error);
+      }
+    }
+
+    if (event.body.init) {
+      async function deleteItems(tableName, partitionId) {
+        const queryParams = {
+          TableName: tableName,
+          KeyConditionExpression:
+            "#group_delivery_guy_id = :group_delivery_guy_id",
+          ExpressionAttributeNames: {
+            "#group_delivery_guy_id": "group_delivery_guy_id"
+          },
+          ExpressionAttributeValues: { ":group_delivery_guy_id": partitionId }
+        };
+
+        const queryResults = await client.query(queryParams).promise();
+
+        if (queryResults.Items && queryResults.Items.length > 0) {
+          const batchCalls = _.chunk(queryResults.Items, 25).map(
+            async (chunk) => {
+              const deleteRequests = chunk.map((item) => {
+                return {
+                  DeleteRequest: {
+                    Key: {
+                      group_delivery_guy_id: item.group_delivery_guy_id,
+                      timestamp: item.timestamp
+                    }
+                  }
+                };
+              });
+              const batchWriteParams = {
+                RequestItems: {
+                  [tableName]: deleteRequests
+                }
+              };
+              await client.batchWrite(batchWriteParams).promise();
+            }
+          );
+          await Promise.all(batchCalls);
+        }
+      }
+      const params = {
+        TableName: "dm-delivery-guys",
+        KeyConditionExpression: "#group = :group",
+        ExpressionAttributeNames: {
+          "#group": "group"
+        },
+        ExpressionAttributeValues: {
+          ":group": group
+        }
+      };
+      const deliveryGuys = await client.query(params).promise();
+      _.forEach(deliveryGuys.Items, async (obj) => {
+        await deleteItems(
+          "dm-delivery-guys-actions",
+          obj.group_delivery_guy_id
+        );
+        await deleteItems(
+          "dm-delivery-guys-coordinates",
+          obj.group_delivery_guy_id
+        );
+      });
+      const prunedItems = prune_null(deliveryGuys.Items);
+      await Promise.all(
+        prunedItems.map(async (item) => {
+          const modifiedItem = { ...item };
+          modifiedItem.simulation_data = {};
+          modifiedItem.simulation_data.allAcceptedRequests = {};
+          modifiedItem.simulation_data.request = {};
+          modifiedItem.simulation_data.onRequest = false;
+          modifiedItem.simulation_data.request.store_id = "";
+          modifiedItem.simulation_data.request.request_id = "";
+          modifiedItem.simulation_data.polyline = [];
+          modifiedItem.simulation_data.pathCopy = [];
+          modifiedItem.simulation_data.path = [];
+          modifiedItem.simulation_data.currentLocation = {};
+          modifiedItem.simulation_data.final = {};
+          const zones = await recursive_query(zonesParams, null);
+          const foundZone = _.find(zones, { store_id: modifiedItem.store_id });
+          const BOUNDARIES_STRING = foundZone.deliveryAreas[1].boundaries;
+          const MAP_BOUNDARIES = parseBoundaries(BOUNDARIES_STRING);
+          const startingPoing = getRandomPointInArea(MAP_BOUNDARIES);
+          modifiedItem.simulation_data.currentLocation.latitude =
+            startingPoing.latitude;
+          modifiedItem.simulation_data.currentLocation.longitude =
+            startingPoing.longitude;
+          await client
+            .put({
+              TableName: "dm-delivery-guys",
+              Item: modifiedItem
+            })
+            .promise();
+          return modifiedItem;
+        })
+      );
+    }
+    const dgparams = {
+      TableName: "dm-delivery-guys",
+      KeyConditionExpression: "#group = :group",
+      ExpressionAttributeNames: {
+        "#group": "group"
+      },
+      ExpressionAttributeValues: {
+        ":group": group
+      }
+    };
+    const delivery_guys = await client
+      .query(dgparams)
+      .promise()
+      .then((data) => prune_null(data.Items))
+      .then((items) =>
+        items.map((item) => {
+          return _.omit(item, "password");
+        })
+      );
+    const deliveryGuyIds = _.map(delivery_guys, "delivery_guy_id");
+    async function processDeliveryGuys(deliveryGuyId) {
+      console.log("deliveryGuyId", deliveryGuyId);
+      const body = event.body;
+      function decodePolyline(polyline) {
+        const polylineDecoder = require("polyline");
+        return polylineDecoder.decode(polyline);
+      }
+
+      async function putRequestActions(type, request, delivery_guy) {
+        const dispatched_timestamp = Date.now().toString();
+        const days = 14;
+        const HOUR = 60 * 60;
+        const secondsSinceEpoch = Math.round(Date.now() / 1000);
+        const expirationTime = secondsSinceEpoch + days * 24 * HOUR;
+        const params = {
+          TableName: "dm-requests-actions",
+          Item: {
+            type: `delivery_request_status`,
+            status: type,
+            group: group,
+            request_id: request.request_id,
+            device_id: "test",
+            delivery_guy_id: delivery_guy.delivery_guy_id,
+            group_request_id: `${group}_${request.request_id}`,
+            timestamp: dispatched_timestamp,
+            expire: Number.parseInt(expirationTime)
+          },
+          ConditionExpression: "attribute_not_exists(#timestamp)",
+          ExpressionAttributeNames: {
+            "#timestamp": "timestamp"
+          }
+        };
+
+        console.log("params", params);
+        await client
+          .put(prune_empty(params))
+          .promise()
+          .catch((err) => {
+            if (err && err.code === "ConditionalCheckFailedException") {
+              console.log("action_already_exists");
+              return Promise.resolve();
+            }
+            console.log("err", err);
+            throw new CustomError("classic_error");
+          });
+      }
+
+      async function getDirections(origin, destination) {
+        let newArrayOfObjects = [];
+        let finalArrayOfPolylines;
+        let storeCoords;
+        let totalSteps;
+        try {
+          let directionsResponse;
+          if (destination.storeAddress) {
+            // edw xwrzoume tin diadromi se 2 kommatia, se store kai pelati
+            directionsResponse = await googleMapsClient.directions({
+              params: {
+                origin: `${origin.latitude},${origin.longitude}`,
+                destination: `${destination.storeAddress.lat},${destination.storeAddress.lng}`,
+                steps: true, // Request detailed steps
+                key: apikey
+              }
+            });
+            await updateGoogleTable();
+            const polyline =
+              directionsResponse.data.routes[0].overview_polyline.points;
+            const distanceValue =
+              directionsResponse.data.routes[0].legs[0].distance.value;
+            const distanceKm = distanceValue / 1000; // Convert to kilometers
+            // Calculate steps (assuming each kilometer corresponds to 5 steps)
+            const stepsPerKilometer = 5;
+            const steps = Math.round(stepsPerKilometer * distanceKm); // Rounded to nearest whole number
+            const detailedCoordinates = decodePolyline(polyline);
+            const arrayOfPolylines = _.map(
+              detailedCoordinates,
+              ([lat, lng]) => ({
+                lat,
+                lng
+              })
+            );
+            const lastObject = _.last(arrayOfPolylines);
+            storeCoords = lastObject;
+            const directionsResponse2 = await googleMapsClient.directions({
+              params: {
+                origin: `${lastObject.lat},${lastObject.lng}`,
+                destination: `${destination.latitude},${destination.longitude}`,
+                steps: true, // Request detailed steps
+                key: apikey
+              }
+            });
+            await updateGoogleTable();
+            const polyline2 =
+              directionsResponse2.data.routes[0].overview_polyline.points;
+            const distanceValue2 =
+              directionsResponse2.data.routes[0].legs[0].distance.value;
+            const distanceKm2 = distanceValue2 / 1000; // Convert to kilometers
+            // Calculate steps (assuming each kilometer corresponds to 5 steps)
+            const stepsPerKilometer2 = 5;
+            const steps2 = Math.round(stepsPerKilometer2 * distanceKm2); // Rounded to nearest whole number
+            totalSteps = steps + steps2;
+            const detailedCoordinates2 = decodePolyline(polyline2);
+            const arrayOfPolylines2 = _.map(
+              detailedCoordinates2,
+              ([lat, lng]) => ({
+                lat,
+                lng
+              })
+            );
+            finalArrayOfPolylines = _.concat(
+              arrayOfPolylines,
+              arrayOfPolylines2
+            );
+            console.log("Detailed Coordinates:", finalArrayOfPolylines);
+          } else {
+            // edw i diadromi einai ena kommati
+            directionsResponse = await googleMapsClient.directions({
+              params: {
+                origin: `${origin.latitude},${origin.longitude}`,
+                destination: `${destination.latitude},${destination.longitude}`,
+                steps: true, // Request detailed steps
+                key: apikey
+              }
+            });
+            await updateGoogleTable();
+            const polyline =
+              directionsResponse.data.routes[0].overview_polyline.points;
+            console.log(
+              "distance",
+              directionsResponse.data.routes[0].legs[0].distance
+            );
+            const distanceValue =
+              directionsResponse.data.routes[0].legs[0].distance.value;
+            const distanceKm = distanceValue / 1000; // Convert to kilometers
+            // Calculate steps (assuming each kilometer corresponds to 5 steps)
+            const stepsPerKilometer = 5;
+            totalSteps = Math.round(stepsPerKilometer * distanceKm); // Rounded to nearest whole number
+            const detailedCoordinates = decodePolyline(polyline);
+            finalArrayOfPolylines = _.map(
+              detailedCoordinates,
+              ([lat, lng]) => ({
+                lat,
+                lng
+              })
+            );
+            console.log("Detailed Coordinates:", finalArrayOfPolylines);
+          }
+          const newArray = [];
+
+          if (destination.storeAddress) {
+            const numberOfObjectsToKeep = totalSteps;
+
+            // Find the index of the object that matches storeCoords
+            const indexOfObjectToKeep = _.findIndex(
+              finalArrayOfPolylines,
+              (item) => _.isEqual(item, storeCoords)
+            );
+
+            // Always keep the first object
+            newArray.push(finalArrayOfPolylines[0]);
+
+            // Calculate the number of middle objects needed to keep (including first and last)
+            const middleObjectsToKeep = numberOfObjectsToKeep - 2;
+            if (middleObjectsToKeep > 0) {
+              const interval = Math.floor(
+                finalArrayOfPolylines.length / middleObjectsToKeep
+              );
+              for (let i = 1; i < finalArrayOfPolylines.length - 1; i++) {
+                if (i === indexOfObjectToKeep || (i - 1) % interval === 0) {
+                  newArray.push(finalArrayOfPolylines[i]);
+                }
+              }
+            }
+
+            newArray.push(
+              finalArrayOfPolylines[finalArrayOfPolylines.length - 1]
+            );
+          } else {
+            const numberOfObjectsToKeep = totalSteps;
+            // Always keep the first object
+            newArray.push(finalArrayOfPolylines[0]);
+            // Calculate the number of middle objects needed to keep (including first and last)
+            const middleObjectsToKeep = numberOfObjectsToKeep - 2;
+            if (middleObjectsToKeep > 0) {
+              const interval = Math.floor(
+                finalArrayOfPolylines.length / middleObjectsToKeep
+              );
+              for (
+                let i = 1;
+                i < finalArrayOfPolylines.length - 1;
+                i += interval
+              ) {
+                newArray.push(finalArrayOfPolylines[i]);
+              }
+            }
+            newArray.push(
+              finalArrayOfPolylines[finalArrayOfPolylines.length - 1]
+            ); // Always keep the last object
+          }
+
+          const steps = newArray;
+          console.log("steps", steps);
+          newArrayOfObjects = _.map(steps, (obj) => ({
+            latitude: obj.lat,
+            longitude: obj.lng
+          }));
+          newArrayOfObjects.polyline = finalArrayOfPolylines;
+          newArrayOfObjects.storeCoords = storeCoords;
+        } catch (error) {
+          console.error("Error:", error.message);
+        }
+        return newArrayOfObjects;
+      }
+
+      function getRandomNumber(min, max) {
+        return Math.random() * (max - min) + min;
+      }
+
+      // Function to convert meters to degrees of latitude/longitude
+      function metersToDegrees(meters, latitude) {
+        return meters / (111.32 * 1000 * Math.cos(latitude * (Math.PI / 180)));
+      }
+
+      // Function to generate a random geographical point approximately distance meters away
+      function generateRandomPointNearby(
+        latitude,
+        longitude,
+        distance,
+        MAP_BOUNDARIES
+      ) {
+        console.log("start", latitude, longitude);
+        const maxDistanceLatitude = metersToDegrees(distance, latitude);
+        const maxDistanceLongitude = metersToDegrees(distance, 0);
+        const newLatitude =
+          latitude + getRandomNumber(-maxDistanceLatitude, maxDistanceLatitude);
+        const newLongitude =
+          longitude +
+          getRandomNumber(-maxDistanceLongitude, maxDistanceLongitude);
+        let pointToCheck = { latitude: newLatitude, longitude: newLongitude };
+        const isInside = isPointInsideArea(pointToCheck, MAP_BOUNDARIES);
+        if (isInside) {
+          console.log("pointToCheck", pointToCheck);
+          console.log("The point is inside the area.");
+        } else {
+          console.log("pointToCheck", pointToCheck);
+          console.log("The point is outside the area.");
+          return generateRandomPointNearby(
+            latitude,
+            longitude,
+            distance,
+            MAP_BOUNDARIES
+          );
+        }
+        console.log("end", newLatitude, newLongitude);
+        return { latitude: newLatitude, longitude: newLongitude };
+      }
+
+      function isPointInsideArea(point, polygonCoordinates) {
+        const latitude = point.latitude;
+        const longitude = point.longitude;
+        let isInside = false;
+        for (
+          let i = 0, j = polygonCoordinates.length - 1;
+          i < polygonCoordinates.length;
+          j = i++
+        ) {
+          if (
+            polygonCoordinates[i].latitude > latitude !==
+              polygonCoordinates[j].latitude > latitude &&
+            longitude <
+              ((polygonCoordinates[j].longitude -
+                polygonCoordinates[i].longitude) *
+                (latitude - polygonCoordinates[i].latitude)) /
+                (polygonCoordinates[j].latitude -
+                  polygonCoordinates[i].latitude) +
+                polygonCoordinates[i].longitude
+          ) {
+            isInside = !isInside;
+          }
+        }
+        return isInside;
+      }
+
+      async function simulationProcess(delivery_guy) {
+        function getRandomChoice() {
+          //edw vazoume random status
+          const weightedChoices = [
+            { choice: "available", weight: 0.9 },
+            { choice: "unavailable", weight: 0.001 },
+            { choice: "returning_to_base", weight: 0.001 },
+            { choice: "in_base", weight: 0.001 },
+            { choice: "on_break_time", weight: 0.001 },
+            { choice: "off_duty", weight: 0.001 }
+          ];
+          const randomValue = Math.random();
+          let cumulativeWeight = 0;
+          for (const weightedChoice of weightedChoices) {
+            cumulativeWeight += weightedChoice.weight;
+            if (randomValue < cumulativeWeight) {
+              return weightedChoice.choice;
+            }
+          }
+        }
+        const randomChoice = getRandomChoice();
+        console.log("Random Choice:", randomChoice);
+        const randomValue = _.random(4, 10);
+        if (
+          randomChoice === "unavailable" ||
+          randomChoice === "off_duty" ||
+          randomChoice === "on_break_time" ||
+          randomValue <= 3
+        ) {
+          // edw vazoume 30% chance na mpei se dialima ektos k an exei idiko status tote alazoume ton xrono
+          const currentTimestamp = Date.now();
+          let randomNumber = _.random(1, 7);
+          if (randomChoice === "unavailable") {
+            randomNumber = _.random(7, 14);
+          }
+          if (randomChoice === "off_duty") {
+            randomNumber = _.random(10, 20);
+          }
+          const sevenMinutesLaterTimestamp =
+            currentTimestamp + randomNumber * 60 * 1000;
+          delivery_guy.simulation_data.doNotMoveUntil =
+            sevenMinutesLaterTimestamp;
+          delivery_guy.status = randomChoice;
+          if (randomChoice === "available") {
+            delivery_guy.status = "on_break_time";
+          }
+          await client
+            .put({
+              TableName: "dm-delivery-guys",
+              Item: delivery_guy
+            })
+            .promise();
+        } else {
+          delivery_guy.status = randomChoice;
+          await client
+            .put({
+              TableName: "dm-delivery-guys",
+              Item: delivery_guy
+            })
+            .promise();
+        }
+        const updated_delivery_guy = await client
+          .get({
+            TableName: "dm-delivery-guys",
+            Key: {
+              group,
+              delivery_guy_id: delivery_guy.delivery_guy_id
+            }
+          })
+          .promise()
+          .then((data) => prune_null(data.Item));
+        delivery_guy = updated_delivery_guy;
+        return delivery_guy;
+      }
+
+      const put_action = async (action, delivery_guy) => {
+        try {
+          let test;
+          let randomData;
+          function getRandomFloat(min, max) {
+            return Math.random() * (max - min) + min;
+          }
+          const HOUR = 60 * 60;
+          const secondsSinceEpoch = Math.round(Date.now() / 1000);
+          const expirationTime = secondsSinceEpoch + 48 * HOUR;
+          const zones = await recursive_query(zonesParams, null);
+          const foundZone = _.find(zones, { store_id: delivery_guy.store_id });
+          const BOUNDARIES_STRING = foundZone.deliveryAreas[1].boundaries;
+          const MAP_BOUNDARIES = parseBoundaries(BOUNDARIES_STRING);
+          let nostart;
+          let nofinish;
+          let startingPoing;
+          let dontStart;
+          let randomChoice;
+          let devGuyStatus;
+          if (
+            delivery_guy.simulation_data &&
+            delivery_guy.simulation_data.path &&
+            delivery_guy.simulation_data.path[0] &&
+            delivery_guy.simulation_data.path[0].latitude &&
+            delivery_guy.simulation_data.path[0].longitude
+          ) {
+            startingPoing = {
+              latitude: delivery_guy.simulation_data.path[0].latitude,
+              longitude: delivery_guy.simulation_data.path[0].longitude
+            };
+          } else if (_.isEmpty(delivery_guy.simulation_data.path)) {
+            const currentTimestamp = Date.now();
+            if (
+              delivery_guy &&
+              delivery_guy.simulation_data &&
+              delivery_guy.simulation_data.doNotMoveUntil &&
+              !(delivery_guy.simulation_data.doNotMoveUntil < currentTimestamp)
+            ) {
+              dontStart = true;
+            } else {
+              delivery_guy = await simulationProcess(delivery_guy);
+            }
+            startingPoing = {
+              latitude: delivery_guy.simulation_data.currentLocation.latitude,
+              longitude: delivery_guy.simulation_data.currentLocation.longitude
+            };
+          } else {
+            const currentTimestamp = Date.now();
+            if (
+              delivery_guy &&
+              delivery_guy.simulation_data &&
+              delivery_guy.simulation_data.doNotMoveUntil &&
+              !(delivery_guy.simulation_data.doNotMoveUntil < currentTimestamp)
+            ) {
+              dontStart = true;
+            } else {
+              delivery_guy = await simulationProcess(delivery_guy);
+            }
+            startingPoing = getRandomPointInArea(MAP_BOUNDARIES);
+            nostart = true;
+          }
+          let finalDestination;
+          let dontGoToStore;
+          const reqParams = {
+            TableName: "dm-requests",
+            KeyConditionExpression: "#group = :group",
+            ExpressionAttributeNames: {
+              "#group": "group"
+            },
+            ExpressionAttributeValues: {
+              ":group": group
+            }
+          };
+          const requests = await client
+            .query(reqParams)
+            .promise()
+            .then((data) => prune_null(data.Items));
+          const filteredOrders = _.filter(requests, {
+            delivery_guy_id: delivery_guy.delivery_guy_id
+          });
+          const acceptedArray = _.filter(filteredOrders, (order) => {
+            const status = order.status;
+            return  status === "auto_dispatched"|| status === "manual_dispatched"|| status === "accepted";
+          });
+          const newData = [];
+          for (const obj of acceptedArray) {
+            let body = {};
+            body.addressInfo = {
+              userLat: obj.address.googleLat,
+              userLng: obj.address.googleLng,
+              group: group
+            };
+            const customerResponse = await lambda_invoke(
+              "dm-cf-check-address-areas",
+              "$LATEST",
+              "RequestResponse",
+              { body: JSON.stringify(body) }
+            );
+            if (customerResponse) {
+              newData.push(obj);
+            }
+          }
+          // if (
+          //   delivery_guy.simulation_data.onRequest &&
+          //   !_.isEmpty(acceptedArray) &&
+          //   acceptedArray[0].store_id ===
+          //     delivery_guy.simulation_data.request.store_id
+          // ) {
+          //   const currentLocation = {
+          //     lat: delivery_guy.simulation_data.currentLocation.latitude,
+          //     lng: delivery_guy.simulation_data.currentLocation.longitude
+          //   };
+          //   const specificObjectIndex = _.findIndex(
+          //     delivery_guy.simulation_data.polyline,
+          //     delivery_guy.simulation_data.request.storeCoords
+          //   );
+          //   const givenObject = currentLocation; // The given object you want to check
+          //   const givenObjectIndex = _.findIndex(
+          //     delivery_guy.simulation_data.polyline,
+          //     givenObject
+          //   );
+          //   if (specificObjectIndex === -1 || givenObjectIndex === -1) {
+          //     console.log("One of the objects wasn't found in the array.");
+          //   } else if (specificObjectIndex > givenObjectIndex) {
+          //     const requestIdsToAdd = [];
+          //     for (const acceptedObject of acceptedArray) {
+          //       if (acceptedObject.status === "accepted") {
+          //         requestIdsToAdd.push(acceptedObject.request_id);
+          //       }
+          //     }
+          //     delivery_guy.simulation_data.allAcceptedRequests =
+          //       requestIdsToAdd;
+          //     console.log(
+          //       "The given object is located before the specific object.1"
+          //     );
+          //   }
+          // }
+          if (
+            delivery_guy.simulation_data &&
+            delivery_guy.simulation_data.currentLocation &&
+            delivery_guy.simulation_data.onRequest
+          ) {
+            const latExists =
+              delivery_guy?.simulation_data?.path[0]?.latitude !== undefined;
+            const lngExists =
+              delivery_guy?.simulation_data?.path[0]?.longitude !== undefined;
+            const currentLocation = {
+              lat: latExists
+                ? delivery_guy.simulation_data.path[0].latitude
+                : delivery_guy.simulation_data.currentLocation.latitude,
+              lng: lngExists
+                ? delivery_guy.simulation_data.path[0].longitude
+                : delivery_guy.simulation_data.currentLocation.longitude
+            };
+            const specificObjectIndex = _.findIndex(
+              delivery_guy.simulation_data.polyline,
+              delivery_guy.simulation_data.request.storeCoords
+            );
+            const givenObjectIndex = _.findIndex(
+              delivery_guy.simulation_data.polyline,
+              currentLocation
+            );
+            if (specificObjectIndex === -1 || givenObjectIndex === -1) {
+              console.log("One of the objects wasn't found in the array.");
+            } else if (specificObjectIndex < givenObjectIndex) {
+              const request = await client
+                .get({
+                  TableName: "dm-requests",
+                  Key: {
+                    group,
+                    request_id: delivery_guy.simulation_data.request.requestId
+                  }
+                })
+                .promise()
+                .then((data) => prune_null(data.Item));
+              if (
+                request.testGoingClient &&
+                request.status !== "arrived_to_customer"
+              ) {
+                request.status = "start_delivery";
+              }
+              if (!request.testFinal && !request.testGoingClient) {
+                request.status = "start_delivery";
+                request.testGoingClient = "done";
+                request.accepted_timestamp = Date.now();
+              }
+              if (!request.testArrived || !request.testServing) {
+                if (!request.testArrived) {
+                  await putRequestActions(
+                    "arrived_to_store",
+                    request,
+                    delivery_guy
+                  );
+                  request.testArrived = "done";
+                }
+                await putRequestActions(
+                  "start_delivery",
+                  request,
+                  delivery_guy
+                );
+                request.testServing = "done";
+              }
+              if (!request.arrived_to_store_timestamp) {
+                request.arrived_to_store_timestamp = Date.now();
+                request.start_delivery_timestamp = Date.now();
+              }
+              await client
+                .put({
+                  TableName: "dm-requests",
+                  Item: request
+                })
+                .promise();
+              // if (
+              //   delivery_guy.simulation_data.allAcceptedRequests &&
+              //   !_.isEmpty(delivery_guy.simulation_data.allAcceptedRequests)
+              // ) {
+              //   for (const requestId of delivery_guy.simulation_data
+              //     .allAcceptedRequests) {
+              //     const request = await client
+              //       .get({
+              //         TableName: "dm-requests",
+              //         Key: {
+              //           group,
+              //           request_id: requestId
+              //         }
+              //       })
+              //       .promise()
+              //       .then((data) => prune_null(data.Item));
+              //     if (!request.testFinal) {
+              //       request.status = "arrived_to_store";
+              //     }
+              //     if (!request.testArrived || !request.testServing) {
+              //       if (!request.testArrived) {
+              //         await putRequestActions(
+              //           "arrived_to_store",
+              //           request,
+              //           delivery_guy
+              //         );
+              //         const currentTime = new Date().getTime();
+              //         const timestamp = currentTime + 1 * 60 * 1000;
+              //         request.testStartPathFrom = timestamp;
+              //         request.testArrived = "done";
+              //         request.testSecondaryRequest = "done";
+              //         request.start_servicing_request_timestamp = Date.now();
+              //       }
+              //       await putRequestActions(
+              //         "start_servicing_request",
+              //         request,
+              //         delivery_guy
+              //       );
+              //       request.testServing = "done";
+              //     }
+              //     if (!request.arrived_to_store_timestamp) {
+              //       request.start_delivery_timestamp = Date.now();
+              //     }
+              //     if (!request.arrived_to_store_timestamp) {
+              //       request.arrived_to_store_timestamp = Date.now();
+              //     }
+              //     await client
+              //       .put({
+              //         TableName: "dm-requests",
+              //         Item: request
+              //       })
+              //       .promise();
+              //   }
+              // }
+              devGuyStatus = "going_to_client";
+              console.log(
+                "The given object is located after the specific object."
+              );
+            } else if (specificObjectIndex > givenObjectIndex) {
+              devGuyStatus = "going_to_base";
+              console.log(
+                "The given object is located before the specific object."
+              );
+            } else {
+              const request = await client
+                .get({
+                  TableName: "dm-requests",
+                  Key: {
+                    group,
+                    request_id: delivery_guy.simulation_data.request.requestId
+                  }
+                })
+                .promise()
+                .then((data) => prune_null(data.Item));
+              request.status = "arrived_to_store";
+              if (!request.testArrived) {
+                await putRequestActions(
+                  "arrived_to_store",
+                  request,
+                  delivery_guy
+                );
+                request.testArrived = "done";
+                request.arrived_to_store_timestamp = Date.now();
+                request.start_delivery_timestamp = Date.now();
+                const firstObject = delivery_guy.simulation_data.path[0];
+                delivery_guy.simulation_data.path.splice(
+                  0,
+                  0,
+                  firstObject,
+                  firstObject,
+                  firstObject
+                );
+              }
+              await client
+                .put({
+                  TableName: "dm-requests",
+                  Item: request
+                })
+                .promise();
+              if (
+                delivery_guy.simulation_data.allAcceptedRequests &&
+                !_.isEmpty(delivery_guy.simulation_data.allAcceptedRequests)
+              ) {
+                for (const requestId of delivery_guy.simulation_data
+                  .allAcceptedRequests) {
+                  const request = await client
+                    .get({
+                      TableName: "dm-requests",
+                      Key: {
+                        group,
+                        request_id: requestId
+                      }
+                    })
+                    .promise()
+                    .then((data) => prune_null(data.Item));
+                  request.status = "arrived_to_store";
+                  if (!request.testArrived) {
+                      await putRequestActions(
+                "accepted",
+                acceptedArray[0],
+                delivery_guy
+              );
+                    await putRequestActions(
+                      "arrived_to_store",
+                      request,
+                      delivery_guy
+                    );
+                    const currentTime = new Date().getTime();
+                    const timestamp = currentTime + 1 * 60 * 1000;
+                    request.testStartPathFrom = timestamp;
+                    request.testArrived = "done";
+                    request.testSecondaryRequest = "done";
+                    request.arrived_to_store_timestamp = Date.now();
+                    request.start_delivery_timestamp = Date.now();
+                    request.start_servicing_request_timestamp = Date.now();
+                    request.accepted_timestamp = Date.now();
+                    const firstObject = delivery_guy.simulation_data.path[0];
+                    delivery_guy.simulation_data.path.splice(
+                      0,
+                      0,
+                      firstObject,
+                      firstObject,
+                      firstObject
+                    );
+                  }
+                  await client
+                    .put({
+                      TableName: "dm-requests",
+                      Item: request
+                    })
+                    .promise();
+                }
+              }
+              devGuyStatus = "on_base";
+              console.log(
+                "The given object is the same as the specific object."
+              );
+            }
+          }
+          if (
+            delivery_guy.simulation_data.allAcceptedRequests &&
+            delivery_guy.simulation_data.allAcceptedRequests[0] &&
+            !delivery_guy.simulation_data.onRequest
+          ) {
+            const newRequest = await client
+              .get({
+                TableName: "dm-requests",
+                Key: {
+                  group,
+                  request_id:
+                    delivery_guy.simulation_data.allAcceptedRequests[0]
+                }
+              })
+              .promise()
+              .then((data) => prune_null(data.Item));
+            if (
+              newRequest &&
+              newRequest.status &&
+              (newRequest.status === "accepted" ||
+                newRequest.status === "order_picked_up" ||
+                newRequest.status === "arrived_to_store")
+            ) {
+              dontGoToStore = true;
+              acceptedArray[0] = newRequest;
+              delivery_guy.simulation_data.allAcceptedRequests.shift();
+            }
+          }
+          if (
+            filteredOrders &&
+            acceptedArray &&
+            !_.isEmpty(filteredOrders) &&
+            !_.isEmpty(acceptedArray) &&
+            acceptedArray[0] &&
+            !delivery_guy.simulation_data.onRequest
+          ) {
+            finalDestination = {
+              latitude: acceptedArray[0].address.googleLat,
+              longitude: acceptedArray[0].address.googleLng,
+              storeAddress: dontGoToStore
+                ? undefined
+                : acceptedArray[0].storeAddress
+            };
+            acceptedArray[0].status = "start_servicing_request";
+            if (!acceptedArray[0].testStarted) {
+              // await putRequestActions(
+              //   "accepted",
+              //   acceptedArray[0],
+              //   delivery_guy
+              // );
+              acceptedArray[0].testStarted = "done";
+            }
+            // if (!acceptedArray[0].start_servicing_request_timestamp) {
+            //   await putRequestActions(
+            //     "start_servicing_request",
+            //     acceptedArray[0],
+            //     delivery_guy
+            //   );
+            //   acceptedArray[0].start_servicing_request_timestamp = Date.now();
+            // }
+            await client
+              .put({
+                TableName: "dm-requests",
+                Item: acceptedArray[0]
+              })
+              .promise();
+            test = await getDirections(startingPoing, finalDestination);
+            console.log("test", test);
+            delivery_guy.demoMode = true;
+            delivery_guy.simulation_data.path = test;
+            delivery_guy.simulation_data.pathCopy = test;
+            delivery_guy.simulation_data.polyline = test.polyline;
+            if (
+              _.size(delivery_guy.simulation_data.path) > 300 ||
+              _.size(delivery_guy.simulation_data.polyline) > 300
+            ) {
+              console.log(_.last(delivery_guy.simulation_data.path));
+              console.log(_.last(delivery_guy.simulation_data.polyline));
+              console.log(delivery_guy.simulation_data.path.length);
+              console.log(delivery_guy.simulation_data.polyline.length);
+              throw new CustomError("The array has more than 300 objects.");
+            }
+            const lastObject = _.last(delivery_guy.simulation_data.path);
+            delivery_guy.simulation_data.final = lastObject;
+            delivery_guy.simulation_data.onRequest = true;
+            delivery_guy.simulation_data.request = {
+              requestId: acceptedArray[0].request_id,
+              store_id: acceptedArray[0].store_id,
+              storeCoords: test.storeCoords
+            };
+            await client
+              .put({
+                TableName: "dm-delivery-guys",
+                Item: delivery_guy
+              })
+              .promise();
+          }
+          if (
+            delivery_guy.simulation_data &&
+            delivery_guy.simulation_data.final &&
+            delivery_guy.simulation_data.final.latitude &&
+            delivery_guy.simulation_data.final.longitude &&
+            !_.isEmpty(delivery_guy.simulation_data.path)
+          ) {
+            finalDestination = {
+              latitude: delivery_guy.simulation_data.final.latitude,
+              longitude: delivery_guy.simulation_data.final.longitude
+            };
+          } else {
+            finalDestination = generateRandomPointNearby(
+              startingPoing.latitude,
+              startingPoing.longitude,
+              maxDinst,
+              MAP_BOUNDARIES
+            );
+            nofinish = true;
+          }
+          if (!(randomChoice === "off_duty")) {
+            const currentTimestamp = Date.now();
+            if (
+              delivery_guy &&
+              delivery_guy.simulation_data &&
+              delivery_guy.simulation_data.doNotMoveUntil &&
+              !(delivery_guy.simulation_data.doNotMoveUntil < currentTimestamp)
+            ) {
+              dontStart = true;
+            } else {
+              delivery_guy = _.omit(
+                delivery_guy,
+                "simulation_data.doNotMoveUntil"
+              );
+              if (devGuyStatus) {
+                delivery_guy.status = devGuyStatus;
+              } else {
+                delivery_guy.status = "available";
+              }
+            }
+            if (!dontStart) {
+              if (nostart || nofinish) {
+                finalDestination = generateRandomPointNearby(
+                  startingPoing.latitude,
+                  startingPoing.longitude,
+                  maxDinst,
+                  MAP_BOUNDARIES
+                );
+                test = await getDirections(startingPoing, finalDestination);
+                delivery_guy.demoSemiMode = true;
+                console.log("test", test);
+                delivery_guy.simulation_data.path = test;
+                delivery_guy.simulation_data.polyline = test.polyline;
+                await client
+                  .put({
+                    TableName: "dm-delivery-guys",
+                    Item: delivery_guy
+                  })
+                  .promise();
+              }
+              test = {
+                latitude: delivery_guy.simulation_data.path[0].latitude,
+                longitude: delivery_guy.simulation_data.path[0].longitude
+              };
+
+              const snappedPosition = {
+                latitude: test.latitude,
+                longitude: test.longitude
+              };
+              const randomValue = _.random(0, 1, true);
+              // edw dinoume pithanotita 5% o devGuy na katsei sto "idio" simio
+              if (randomValue <= 0.01) {
+                let newObjects = [];
+                console.log("o devGuy emine sto idio tetragono");
+                const lastPoint = delivery_guy.simulation_data.path[0];
+                const randomNumber = _.random(4, 8);
+                for (let i = 0; i < randomNumber; i++) {
+                  const randomPoint = getRandomPointNearby(lastPoint, 10);
+                  newObjects.push(randomPoint);
+                  delivery_guy.simulation_data.path.splice(0, 0, randomPoint);
+                }
+                const index = _.findIndex(
+                  delivery_guy.simulation_data.polyline,
+                  { lat: lastPoint.latitude, lng: lastPoint.longitude }
+                );
+                if (index !== -1) {
+                  delivery_guy.simulation_data.polyline.splice(
+                    index,
+                    0,
+                    ...newObjects
+                  );
+                }
+              }
+              delivery_guy.simulation_data.path = _.drop(
+                delivery_guy.simulation_data.path
+              );
+              if (_.isEmpty(delivery_guy.simulation_data.path)) {
+                if (
+                  delivery_guy.simulation_data.request &&
+                  delivery_guy.simulation_data.request.requestId
+                ) {
+                  const request = await client
+                    .get({
+                      TableName: "dm-requests",
+                      Key: {
+                        group,
+                        request_id:
+                          delivery_guy.simulation_data.request.requestId
+                      }
+                    })
+                    .promise()
+                    .then((data) => prune_null(data.Item));
+                  if (!request.testFinal) {
+                    const currentTime = new Date().getTime();
+                    request.arrived_to_customer_timestamp = Date.now();
+                    request.start_servicing_customer_timestamp = Date.now();
+                    request.service_customer_user_estimated_timestamp =
+                      currentTime + 3 * 60 * 1000;
+                    request.testFinal = "done";
+                    const lastObject = _.last(
+                      delivery_guy.simulation_data.pathCopy
+                    );
+                    const randomNumber = _.random(4, 8);
+                    for (let i = 0; i < randomNumber; i++) {
+                      delivery_guy.simulation_data.path.push(lastObject);
+                    }
+                    request.status = "arrived_to_customer";
+                    await client
+                      .put({
+                        TableName: "dm-requests",
+                        Item: request
+                      })
+                      .promise();
+                  } else {
+                    delivery_guy.demoMode = false;
+                    request.status = "completed";
+                    if (!request.testCompleted) {
+                      await putRequestActions(
+                        "completed",
+                        request,
+                        delivery_guy
+                      );
+                      request.testCompleted = "done";
+                    }
+                    request.completed_timestamp = Date.now();
+                    await client
+                      .put({
+                        TableName: "dm-requests",
+                        Item: request
+                      })
+                      .promise();
+                    if (dontGoToStore) {
+                      delivery_guy.simulation_data.onRequest = true;
+                    } else {
+                      delivery_guy.simulation_data.onRequest = false;
+                    }
+                    delivery_guy.simulation_data.request = {};
+                    delivery_guy.status = "available";
+                  }
+                }
+                delivery_guy.demoSemiMode = false;
+              }
+              await client
+                .put({
+                  TableName: "dm-delivery-guys",
+                  Item: delivery_guy
+                })
+                .promise();
+
+              if (snappedPosition) {
+                // Update the delivery guy's position to the new snapped position
+                delivery_guy.simulation_data.currentLocation = snappedPosition;
+                delivery_guy.simulation_data.final = finalDestination;
+                delivery_guy.lastTimestamp = Date.now();
+                await client
+                  .put({
+                    TableName: "dm-delivery-guys",
+                    Item: delivery_guy
+                  })
+                  .promise();
+              }
+
+              randomData = {
+                accuracy: 1,
+                lat: snappedPosition.latitude,
+                lng: snappedPosition.longitude,
+                speed: getRandomFloat(0, 0.0001)
+              };
+            }
+            if (!randomData) {
+              if (!delivery_guy) {
+                // Initialize delivery_guy if it doesn't exist
+                delivery_guy = {
+                  simulation_data: {
+                    currentLocation: {
+                      latitude: 0,
+                      longitude: 0
+                    }
+                  }
+                };
+              } else if (!delivery_guy.simulation_data) {
+                // Initialize simulation_data if it doesn't exist
+                delivery_guy.simulation_data = {
+                  currentLocation: {
+                    latitude: 0,
+                    longitude: 0
+                  }
+                };
+              } else if (
+                delivery_guy.simulation_data.currentLocation &&
+                delivery_guy.simulation_data.currentLocation.latitude !==
+                  undefined &&
+                delivery_guy.simulation_data.currentLocation.longitude !==
+                  undefined
+              ) {
+                // Use the existing currentLocation values
+                randomData = {
+                  accuracy: 1,
+                  lat: delivery_guy.simulation_data.currentLocation.latitude,
+                  lng: delivery_guy.simulation_data.currentLocation.longitude,
+                  speed: getRandomFloat(0, 0.0001)
+                };
+              } else {
+                // Initialize currentLocation if latitude or longitude is missing
+                delivery_guy.simulation_data.currentLocation = {
+                  latitude: 0,
+                  longitude: 0
+                };
+
+                randomData = {
+                  accuracy: 1,
+                  lat: 0,
+                  lng: 0,
+                  speed: getRandomFloat(0, 0.0001)
+                };
+              }
+            }
+            const response = await lambda_invoke(
+              "paneldelivery-cf-app-async-actions",
+              "$LATEST",
+              "RequestResponse",
+              {
+                group,
+                device_id,
+                paused: !!body.paused,
+                delivery_guy_id: delivery_guy.delivery_guy_id,
+                group_delivery_guy_id: `${group}_${delivery_guy.delivery_guy_id}`,
+                timestamp: new Date().getTime().toString(),
+                type: "location",
+                data: randomData,
+                expire: Number.parseInt(expirationTime)
+              }
+            );
+            console.log("response", response);
+          }
+
+          return Promise.resolve();
+        } catch (err) {
+          console.log("Error in put_action:", err);
+          throw new CustomError("put_action_error");
+        }
+      };
+
+      const delivery_guy = await client
+        .get({
+          TableName: "dm-delivery-guys",
+          Key: {
+            group,
+            delivery_guy_id: deliveryGuyId
+          }
+        })
+        .promise()
+        .then((data) => prune_null(data.Item));
+
+      if (!delivery_guy) {
+        throw new CustomError("delivery_guy_does_not_exist");
+      }
+
+      if (!_.isEmpty(body.actions)) {
+        console.log("body.actions", body.actions.length);
+        await Promise.mapSeries(body.actions, async (action) => {
+          await put_action(action, delivery_guy);
+          return Promise.resolve();
+        });
+      }
+    }
+    async function main() {
+      try {
+        console.log("deliveryGuyIds", deliveryGuyIds);
+        for (const deliveryGuyId of deliveryGuyIds) {
+          await processDeliveryGuys(deliveryGuyId);
+        }
+      } catch (err) {
+        console.error("Error:", err.message);
+      }
+    }
+
+    // Call the main function to start processing
+    await main();
+
+    console.log("RequestId SUCCESS");
+
+    return {
+      statusCode: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "application/json; charset=utf-8"
+      },
+      body: JSON.stringify({
+        success: true
+      })
+    };
+  } catch (err) {
+    console.log("catch err", err);
+
+    return {
+      statusCode: 200,
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Content-Type": "application/json; charset=utf-8"
+      },
+      body: JSON.stringify({
+        success: false,
+        comment_id: err instanceof CustomError ? err.message : "classic_error"
+      })
+    };
+  }
+};
